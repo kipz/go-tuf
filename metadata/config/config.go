@@ -48,6 +48,15 @@ type UpdaterConfig struct {
 	// UnsafeLocalMode only uses the metadata as written on disk
 	// if the metadata is incomplete, calling updater.Refresh will fail
 	UnsafeLocalMode bool
+	// ForceRefresh forces a full refresh from the remote repository
+	// even if valid cached metadata exists locally
+	ForceRefresh bool
+	// FallbackToOnline allows falling back to online refresh if unsafe local mode fails
+	// This is only relevant when UnsafeLocalMode is true. When both are true,
+	// Refresh() will first attempt to use local cache, and if that fails,
+	// automatically perform a full online refresh. This ensures metadata stays
+	// in sync when root rotation or other metadata changes occur.
+	FallbackToOnline bool
 }
 
 // New creates a new UpdaterConfig instance used by the Updater to
@@ -75,6 +84,8 @@ func New(remoteURL string, rootBytes []byte) (*UpdaterConfig, error) {
 		DisableLocalCache:     false,                       // enable local caching of trusted metadata
 		PrefixTargetsWithHash: true,                        // use hash-prefixed target files with consistent snapshots
 		UnsafeLocalMode:       false,
+		ForceRefresh:          false,        // by default, use cached metadata when valid
+		FallbackToOnline:      false,        // by default, don't fall back to online if unsafe local fails
 	}, nil
 }
 

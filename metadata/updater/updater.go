@@ -102,7 +102,9 @@ func New(config *config.UpdaterConfig) (*Updater, error) {
 // Downloads, verifies, and loads metadata for the top-level roles in the
 // specified order (root -> timestamp -> snapshot -> targets) implementing
 // all the checks required in the TUF client workflow.
-// A Refresh() can be done only once during the lifetime of an Updater.
+// Refresh() can be called multiple times during the lifetime of an Updater
+// to ensure that the metadata is up-to-date. Each call will reload the
+// timestamp, snapshot, and targets metadata while preserving the root metadata.
 // If Refresh() has not been explicitly called before the first
 // GetTargetInfo() call, it will be done implicitly at that time.
 // The metadata for delegated roles is not updated by Refresh():
@@ -112,10 +114,21 @@ func New(config *config.UpdaterConfig) (*Updater, error) {
 //
 // If UnsafeLocalMode is set, no network interaction is performed, only
 // the cached files on disk are used. If the cached data is not complete,
-// this call will fail.
+// this call will fail unless FallbackToOnline is also set.
+//
+// When both UnsafeLocalMode and FallbackToOnline are true, Refresh() will
+// first attempt to use the local cache, and if that fails, automatically
+// fall back to a full online refresh. This Sigstore-inspired approach ensures
+// that metadata stays in sync when root rotation or other changes occur.
 func (update *Updater) Refresh() error {
 	if update.cfg.UnsafeLocalMode {
-		return update.unsafeLocalRefresh()
+		err := update.unsafeLocalRefresh()
+		// If fallback is enabled and unsafe local refresh failed, try online refresh
+		if err != nil && update.cfg.FallbackToOnline {
+			metadata.GetLogger().Info("Unsafe local refresh failed, falling back to online refresh", "error", err.Error())
+			return update.onlineRefresh()
+		}
+		return err
 	}
 	return update.onlineRefresh()
 }
@@ -123,6 +136,12 @@ func (update *Updater) Refresh() error {
 // onlineRefresh implements the TUF client workflow as described for
 // the Refresh function.
 func (update *Updater) onlineRefresh() error {
+	// Reset workflow state if this is not the first refresh
+	// This allows calling Refresh() multiple times on the same Updater instance
+	if update.trusted.Timestamp != nil || update.trusted.Snapshot != nil {
+		update.trusted.ResetRefreshState()
+	}
+
 	err := update.loadRoot()
 	if err != nil {
 		return err
@@ -148,7 +167,12 @@ func (update *Updater) onlineRefresh() error {
 // The metadata on disk are verified against the provided root though,
 // and expiration dates are verified.
 func (update *Updater) unsafeLocalRefresh() error {
-	// Root is already loaded
+	// Load any rotated roots from disk
+	err := update.loadRootFromDisk()
+	if err != nil {
+		return err
+	}
+
 	// load timestamp
 	var p = filepath.Join(update.cfg.LocalMetadataDir, metadata.TIMESTAMP)
 	data, err := update.loadLocalMetadata(p)
@@ -313,12 +337,16 @@ func (update *Updater) loadTimestamp() error {
 			if errors.Is(err, &metadata.ErrRepository{}) {
 				// local timestamp is not valid, proceed downloading from remote; note that this error type includes several other subset errors
 				log.Info("Local timestamp is not valid")
+			} else if errors.Is(err, &metadata.ErrEqualVersionNumber{}) {
+				// local timestamp version equals current trusted version, proceed to check remote for updates
+				log.Info("Local timestamp version equals trusted version")
 			} else {
 				// another error
 				return err
 			}
+		} else {
+			log.Info("Local timestamp is valid")
 		}
-		log.Info("Local timestamp is valid")
 		// all okay, local timestamp exists and it is valid, nevertheless proceed with downloading from remote
 	}
 	// load from remote (whether local load succeeded or not)
@@ -368,12 +396,12 @@ func (update *Updater) loadSnapshot() error {
 			}
 		} else {
 			// this means snapshot verification/loading succeeded
-			log.Info("Local snapshot is valid: not downloading new one")
-			return nil
+			log.Info("Local snapshot is valid")
+			// Continue to check remote for potential updates
 		}
 	}
-	// local snapshot does not exist or is invalid, update from remote
-	log.Info("Failed to load local snapshot")
+	// check remote for updates (whether local load succeeded or not)
+	log.Info("Checking remote for snapshot updates")
 	if update.trusted.Timestamp == nil {
 		return fmt.Errorf("trusted timestamp not set")
 	}
@@ -422,7 +450,7 @@ func (update *Updater) loadTargets(roleName, parentName string) (*metadata.Metad
 		log.Info("Local role does not exist", "role", roleName)
 	} else {
 		// successfully read a local targets metadata, so let's try to verify and load it to the trusted metadata set
-		delegatedTargets, err := update.trusted.UpdateDelegatedTargets(data, roleName, parentName)
+		_, err := update.trusted.UpdateDelegatedTargets(data, roleName, parentName)
 		if err != nil {
 			// this means targets verification/loading failed
 			if errors.Is(err, &metadata.ErrRepository{}) {
@@ -434,12 +462,12 @@ func (update *Updater) loadTargets(roleName, parentName string) (*metadata.Metad
 			}
 		} else {
 			// this means targets verification/loading succeeded
-			log.Info("Local role is valid: not downloading new one", "role", roleName)
-			return delegatedTargets, nil
+			log.Info("Local role is valid", "role", roleName)
+			// Continue to check remote for potential updates
 		}
 	}
-	// local "roleName" does not exist or is invalid, update from remote
-	log.Info("Failed to load local role", "role", roleName)
+	// check remote for updates (whether local load succeeded or not)
+	log.Info("Checking remote for role updates", "role", roleName)
 	if update.trusted.Snapshot == nil {
 		return nil, fmt.Errorf("trusted snapshot not set")
 	}
@@ -511,6 +539,55 @@ func (update *Updater) loadRoot() error {
 			if err != nil {
 				return err
 			}
+			// also persist versioned root for offline use (e.g., unsafe local mode)
+			versionedRootName := fmt.Sprintf("%d.%s", nextVersion, metadata.ROOT)
+			err = update.persistMetadata(versionedRootName, data)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// loadRootFromDisk loads root metadata from local disk. Sequentially loads and
+// verifies every newer root metadata version available on disk.
+// This is used by unsafe local mode to support root rotation when operating offline.
+func (update *Updater) loadRootFromDisk() error {
+	// calculate boundaries
+	lowerBound := update.trusted.Root.Signed.Version + 1
+	upperBound := lowerBound + update.cfg.MaxRootRotations
+
+	var lastRootData []byte
+	// loop until we find the latest available version of root on disk
+	for nextVersion := lowerBound; nextVersion < upperBound; nextVersion++ {
+		versionedRootName := fmt.Sprintf("%d.%s", nextVersion, metadata.ROOT)
+		rootPath := filepath.Join(update.cfg.LocalMetadataDir, fmt.Sprintf("%s.json", url.PathEscape(versionedRootName)))
+
+		// try to load versioned root from disk
+		data, err := os.ReadFile(rootPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				// no more root versions available on disk, stop the loop
+				break
+			}
+			// some other error occurred
+			return err
+		}
+
+		// verify and load the root metadata
+		_, err = update.trusted.UpdateRoot(data)
+		if err != nil {
+			return err
+		}
+		lastRootData = data
+	}
+
+	// Persist the latest root version to root.json for future use
+	if lastRootData != nil {
+		err := update.persistMetadata(metadata.ROOT, lastRootData)
+		if err != nil {
+			return err
 		}
 	}
 	return nil

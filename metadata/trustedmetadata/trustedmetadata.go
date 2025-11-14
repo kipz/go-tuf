@@ -330,9 +330,30 @@ func (trusted *TrustedMetadata) UpdateDelegatedTargets(targetsData []byte, roleN
 	return trusted.Targets[roleName], nil
 }
 
+// ResetRefreshState resets the workflow state to allow a new refresh cycle.
+// This clears timestamp, snapshot, and targets metadata while preserving
+// the trusted root. This enables calling UpdateTimestamp/UpdateSnapshot/
+// UpdateTargets again, supporting multiple Refresh() calls on the same
+// TrustedMetadata instance.
+//
+// Use case: Long-running processes that need to periodically refresh
+// metadata without creating new TrustedMetadata instances.
+func (trusted *TrustedMetadata) ResetRefreshState() {
+	log := metadata.GetLogger()
+	log.Info("Resetting refresh state for new refresh cycle")
+
+	// Clear timestamp and snapshot to reset workflow guards
+	trusted.Timestamp = nil
+	trusted.Snapshot = nil
+
+	// Clear all targets metadata except what we want to preserve
+	// Note: We don't clear the root as it should persist across refresh cycles
+	trusted.Targets = map[string]*metadata.Metadata[metadata.TargetsType]{}
+}
+
 // loadTrustedRoot verifies and loads "data" as trusted root metadata.
 // Note that an expired initial root is considered valid: expiry is
-// only checked for the final root in “UpdateTimestamp()“.
+// only checked for the final root in "UpdateTimestamp()".
 func (trusted *TrustedMetadata) loadTrustedRoot(rootData []byte) error {
 	log := metadata.GetLogger()
 

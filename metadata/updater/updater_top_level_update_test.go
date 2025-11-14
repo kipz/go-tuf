@@ -293,9 +293,9 @@ func TestUnsafeRefresh(t *testing.T) {
 	for _, role := range metadata.TOP_LEVEL_ROLE_NAMES {
 		var version int
 		if role == metadata.ROOT {
-			// The root file is written when the updater is
-			// created, so the version is reset.
-			version = 1
+			// With root rotation support, unsafe mode now loads rotated roots from disk.
+			// Since we did an online refresh that loaded version 2, unsafe mode finds it.
+			version = 2
 		}
 		assertContentEquals(t, role, &version)
 	}
@@ -303,7 +303,8 @@ func TestUnsafeRefresh(t *testing.T) {
 	assert.Equal(t, metadata.ROOT, updater.trusted.Root.Signed.Type)
 	assert.Equal(t, metadata.SPECIFICATION_VERSION, updater.trusted.Root.Signed.SpecVersion)
 	assert.True(t, updater.trusted.Root.Signed.ConsistentSnapshot)
-	assert.Equal(t, int64(1), updater.trusted.Root.Signed.Version)
+	// With root rotation support, unsafe mode loads all available rotated roots
+	assert.Equal(t, int64(2), updater.trusted.Root.Signed.Version)
 	assert.NotNil(t, updater.trusted.Snapshot)
 	assert.NotNil(t, updater.trusted.Timestamp)
 	assert.Equal(t, 1, len(updater.trusted.Targets))
@@ -1080,4 +1081,167 @@ func TestTimestampEqVersionsCheck(t *testing.T) {
 	timestamp, err := metadata.Timestamp().FromFile(simulator.MetadataDir + "/timestamp.json")
 	assert.NoError(t, err)
 	assert.Equal(t, initialTimestampMetadataVer, timestamp.Signed.Meta["snapshot.json"].Version)
+}
+
+// TestMultipleRefreshCalls verifies that Refresh() can be called multiple times
+// on the same Updater instance to update metadata.
+func TestMultipleRefreshCalls(t *testing.T) {
+	err := loadOrResetTrustedRootMetadata()
+	assert.NoError(t, err)
+
+	updaterConfig, err := loadUpdaterConfig()
+	assert.NoError(t, err)
+
+	// Create updater and do first refresh
+	updater := initUpdater(updaterConfig)
+	err = updater.Refresh()
+	assert.NoError(t, err)
+
+	// Verify initial state
+	firstTimestampVersion := updater.trusted.Timestamp.Signed.Version
+	firstTargetsVersion := updater.trusted.Targets[metadata.TARGETS].Signed.Version
+
+	// Update metadata versions to simulate new publications
+	simulator.Sim.MDTimestamp.Signed.Version += 1
+	simulator.Sim.MDSnapshot.Signed.Version += 1
+	simulator.Sim.MDTargets.Signed.Version += 1
+	simulator.Sim.UpdateTimestamp()
+	simulator.Sim.UpdateSnapshot()
+
+	// Call Refresh() again on the same updater instance
+	err = updater.Refresh()
+	assert.NoError(t, err)
+
+	// Verify metadata was updated
+	secondTimestampVersion := updater.trusted.Timestamp.Signed.Version
+	secondTargetsVersion := updater.trusted.Targets[metadata.TARGETS].Signed.Version
+
+	// Versions should have incremented
+	assert.Greater(t, secondTimestampVersion, firstTimestampVersion)
+	assert.Greater(t, secondTargetsVersion, firstTargetsVersion)
+}
+
+// TestVersionedRootPersistence verifies that rotated root metadata is persisted
+// with version numbers for offline use.
+func TestVersionedRootPersistence(t *testing.T) {
+	err := loadOrResetTrustedRootMetadata()
+	assert.NoError(t, err)
+
+	updaterConfig, err := loadUpdaterConfig()
+	assert.NoError(t, err)
+
+	// Initial refresh
+	_, err = runRefresh(updaterConfig, time.Now())
+	assert.NoError(t, err)
+
+	// Publish root version 2
+	simulator.Sim.MDRoot.Signed.Version += 1
+	simulator.Sim.PublishRoot()
+
+	// Publish root version 3
+	simulator.Sim.MDRoot.Signed.Version += 1
+	simulator.Sim.PublishRoot()
+
+	// Refresh to download rotated roots
+	_, err = runRefresh(updaterConfig, time.Now())
+	assert.NoError(t, err)
+
+	// Verify versioned root files exist (2.root.json and 3.root.json)
+	assertFilesExist(t, []string{"root", "2.root", "3.root", "timestamp", "snapshot", "targets"})
+}
+
+// TestUnsafeLocalModeWithRootRotation verifies that unsafe local mode can load
+// rotated root metadata from disk when operating offline.
+func TestUnsafeLocalModeWithRootRotation(t *testing.T) {
+	err := loadOrResetTrustedRootMetadata()
+	assert.NoError(t, err)
+
+	// First, do online refresh to download metadata
+	onlineConfig, err := loadUpdaterConfig()
+	assert.NoError(t, err)
+
+	_, err = runRefresh(onlineConfig, time.Now())
+	assert.NoError(t, err)
+
+	// Publish root version 2
+	simulator.Sim.MDRoot.Signed.Version += 1
+	simulator.Sim.PublishRoot()
+
+	// Publish root version 3
+	simulator.Sim.MDRoot.Signed.Version += 1
+	simulator.Sim.PublishRoot()
+
+	// Download rotated roots while online
+	_, err = runRefresh(onlineConfig, time.Now())
+	assert.NoError(t, err)
+
+	// Verify versioned roots exist
+	assertFilesExist(t, []string{"root", "2.root", "3.root"})
+
+	// Now switch to unsafe local mode (offline)
+	offlineConfig, err := loadUnsafeUpdaterConfig()
+	assert.NoError(t, err)
+
+	// Create new updater in unsafe local mode - should load all rotated roots
+	updater, err := New(offlineConfig)
+	assert.NoError(t, err)
+
+	// Root should be at initial version (1)
+	assert.Equal(t, int64(1), updater.trusted.Root.Signed.Version)
+
+	// Refresh in unsafe local mode should load rotated roots from disk
+	err = updater.Refresh()
+	assert.NoError(t, err)
+
+	// Root should now be at version 3 after loading rotations
+	assert.Equal(t, int64(3), updater.trusted.Root.Signed.Version)
+}
+
+// TestFallbackToOnlineRefresh verifies that when both UnsafeLocalMode and
+// FallbackToOnline are enabled, the updater falls back to online refresh
+// if unsafe local mode fails.
+func TestFallbackToOnlineRefresh(t *testing.T) {
+	err := loadOrResetTrustedRootMetadata()
+	assert.NoError(t, err)
+
+	// Create config with both UnsafeLocalMode and FallbackToOnline enabled
+	updaterConfig, err := loadUpdaterConfig()
+	assert.NoError(t, err)
+	updaterConfig.UnsafeLocalMode = true
+	updaterConfig.FallbackToOnline = true
+
+	// Don't pre-populate cache, so unsafe local mode will fail
+	// but fallback should succeed
+	updater, err := New(updaterConfig)
+	assert.NoError(t, err)
+
+	// This should try unsafe local first (fail), then fall back to online (succeed)
+	err = updater.Refresh()
+	assert.NoError(t, err)
+
+	// Verify metadata was loaded successfully via fallback
+	assert.NotNil(t, updater.trusted.Timestamp)
+	assert.NotNil(t, updater.trusted.Snapshot)
+	assert.NotNil(t, updater.trusted.Targets[metadata.TARGETS])
+}
+
+// TestUnsafeLocalModeWithoutFallback verifies that unsafe local mode
+// fails when metadata is incomplete and FallbackToOnline is false.
+func TestUnsafeLocalModeWithoutFallback(t *testing.T) {
+	err := loadOrResetTrustedRootMetadata()
+	assert.NoError(t, err)
+
+	// Create config with UnsafeLocalMode but no fallback
+	updaterConfig, err := loadUpdaterConfig()
+	assert.NoError(t, err)
+	updaterConfig.UnsafeLocalMode = true
+	updaterConfig.FallbackToOnline = false // explicitly disable fallback
+
+	// Don't pre-populate cache
+	updater, err := New(updaterConfig)
+	assert.NoError(t, err)
+
+	// This should fail since cache is empty and fallback is disabled
+	err = updater.Refresh()
+	assert.Error(t, err)
 }
